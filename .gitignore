@@ -1,3 +1,4 @@
+*.log
 .venv/
 .aws-sam/
 __pycache__/

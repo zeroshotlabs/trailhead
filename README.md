@@ -76,17 +76,100 @@ Returns `{"status": "healthy"}`.
 
 ## CLI — `trailhead-cli`
 
-The CLI uses boto3 directly (no running server required). Install it locally:
+Install locally:
 
 ```bash
 cd trailhead
 pip install -e .
 ```
 
-### `import-logs`
+### Quickstart: zero-disk nginx log shipping
+
+Point nginx at a named pipe — logs never touch disk:
 
 ```bash
-# Plain text log
+# 1. Create a log group
+trailhead-cli create-group --owner secondpageai_access --retention 30
+
+# 2. Export your API URL and key
+export TRAILHEAD_API_URL=https://<api-id>.execute-api.<region>.amazonaws.com/v1
+export TRAILHEAD_API_KEY=<your-key>
+
+# 3. Start the shipper — it creates the pipe and removes it on exit
+trailhead-cli ship /var/log/nginx/access.pipe -o secondpageai_access --mkfifo &
+
+# 4. Point nginx at the pipe (in your nginx.conf)
+#    access_log /var/log/nginx/access.pipe combined;
+#    Then: nginx -s reload
+```
+
+`--mkfifo` creates the named pipe automatically using Python's `os.mkfifo()` (no system packages needed) and removes it on exit (SIGTERM, SIGINT, or normal shutdown). The shipper auto-reconnects when nginx restarts.
+
+Log groups are named `{prefix}/{owner}` — with the default prefix that's `/trailhead/secondpageai_access`.
+
+### `ship`
+
+Stream logs to the Trailhead API in real time. Reads from a named pipe (FIFO), file, or stdin. Batches lines and POSTs them as NDJSON with connection reuse and automatic retries.
+
+JSON lines are forwarded as-is. Plain text lines (standard nginx/apache format) are wrapped as `{"message": "..."}` with auto-detected timestamps.
+
+```bash
+# Zero-disk: creates the pipe, removes it on exit
+trailhead-cli ship /tmp/access.pipe -o mysite_access --mkfifo
+
+# Tail a regular log file
+trailhead-cli ship /var/log/nginx/access.log -o mysite_access --follow
+
+# Pipe from any process
+my_app 2>&1 | trailhead-cli ship -o myapp
+
+# Read a file once (no --follow), then exit
+trailhead-cli ship /var/log/nginx/access.log.1 -o mysite_access
+
+# Tune batch size and flush interval
+trailhead-cli ship /var/log/app.log -o myapp --follow --batch-size 200 --flush-interval 2
+```
+
+Set `TRAILHEAD_API_URL` and `TRAILHEAD_API_KEY` env vars to avoid passing `--api-url` and `--api-key` every time. Handles SIGTERM/SIGINT gracefully (flushes remaining buffer before exit).
+
+**Running as a systemd service:**
+
+```ini
+# /etc/systemd/system/trailhead-ship.service
+[Unit]
+Description=Trailhead log shipper
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/trailhead-cli ship /var/log/nginx/access.pipe --owner mysite_access --mkfifo
+Environment=TRAILHEAD_API_URL=https://<api-id>.execute-api.<region>.amazonaws.com/v1
+Environment=TRAILHEAD_API_KEY=<your-key>
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### `create-group`
+
+Pre-create a CloudWatch log group for an owner. Use this when you want to set retention or prepare groups before any logs arrive.
+
+```bash
+trailhead-cli create-group --owner mysite_access                  # no expiry
+trailhead-cli create-group --owner mysite_access --retention 30   # expire after 30 days
+trailhead-cli create-group --owner billing -r us-west-2           # different region
+```
+
+### `import-logs`
+
+Bulk-import a local file directly into CloudWatch (via boto3, no API needed). Useful for backfilling historical logs.
+
+The group must already exist, or pass `--create-group` to auto-create.
+
+```bash
+# Plain text log file
 trailhead-cli import-logs access.log --owner nginx --create-group
 
 # JSONL
@@ -96,21 +179,11 @@ trailhead-cli import-logs events.jsonl --owner billing -r us-west-2
 trailhead-cli import-logs app.db --owner backend -f sqlite \
     --table events --ts-col created_at --msg-col payload
 
-# Custom SQL
-trailhead-cli import-logs app.db --owner backend -f sqlite \
-    --query "SELECT * FROM logs WHERE level='ERROR'"
-
-# Dry run
+# Dry run — parse and validate without uploading
 trailhead-cli import-logs huge.log --owner test --dry-run
 ```
 
-### `create-group`
-
-Pre-create a log group with optional retention policy.
-
-```bash
-trailhead-cli create-group --owner myapp --retention 30
-```
+File format is auto-detected from extension (`.log`/`.txt` → text, `.jsonl`/`.ndjson` → JSONL, `.sqlite`/`.db` → SQLite). Override with `--format text|jsonl|sqlite`.
 
 ---
 
