@@ -1,35 +1,33 @@
 # Trailhead
 
-Serverless log ingestion API backed by AWS CloudWatch Logs.
+High-performance async log ingestion API backed by AWS CloudWatch Logs.
 
-- **One-command deploy** — `sam build && sam deploy --guided`, done
-- **Zero external deps** — Lambda handler uses only stdlib + boto3 from the runtime
-- **API-key auth at the edge** — API Gateway manages keys and usage plans; Lambda never sees unauthorized traffic
-- **Owner-based routing** — each `owner` maps to a CloudWatch log group (`/trailhead/{owner}`)
+- **Streaming NDJSON** — clients POST newline-delimited JSON; the server processes lines as they arrive over a single connection (HTTP/1.1 chunked, HTTP/2 via Hypercorn)
+- **Owner-based routing** — each `owner` maps to a dedicated CloudWatch log group (`/trailhead/{owner}`)
+- **Pre-shared key auth** — simple `X-API-Key` header validated against the config
 - **CLI bulk import** — ship `.log`, `.jsonl`, or SQLite databases straight to CloudWatch
 
 ---
 
-## Deploy
-
-Prerequisites: [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html) and configured AWS credentials.
+## Quick start
 
 ```bash
-sam build
-sam deploy --guided   # first time — picks region, stack name, creates S3 bucket
+cd trailhead
+python -m venv .venv && source .venv/bin/activate
+pip install -e .
+
+# Create your config
+cp config.yaml.example config.yaml
+# Edit config.yaml — set a real API key and AWS region
+
+# Pre-create a log group for an owner
+trailhead-cli create-group --owner myapp --region us-east-1
+
+# Start the server
+trailhead
 ```
 
-After deploy, the stack outputs two values:
-
-| Output | Description |
-|---|---|
-| `ApiUrl` | Base URL, e.g. `https://abc123.execute-api.us-east-1.amazonaws.com/v1` |
-| `ApiKeyId` | Key ID — retrieve the secret with the command below |
-
-```bash
-# Get your API key value
-aws apigateway get-api-key --api-key <ApiKeyId> --include-value --query 'value' --output text
-```
+The API listens on `0.0.0.0:8000` by default (configurable in `config.yaml`).
 
 ---
 
@@ -37,24 +35,26 @@ aws apigateway get-api-key --api-key <ApiKeyId> --include-value --query 'value' 
 
 ### `POST /ingest?owner={owner}`
 
-Accepts **NDJSON** (one JSON object per line).
+Accepts **NDJSON** (one JSON object per line). Streams the request body so clients can keep a connection open and push lines continuously.
 
 | Header / Param | Required | Description |
 |---|---|---|
-| `x-api-key` | yes | API key managed by API Gateway |
+| `X-API-Key` | yes | Pre-shared API key from config |
 | `owner` (query) | yes | Owner tag — routes to `/trailhead/{owner}` log group |
 
-Each JSON line may include a `timestamp` field (epoch-ms, epoch-s, or ISO-8601). If absent, server receipt time is used.
+Each JSON line may contain an optional `timestamp` field (epoch-ms, epoch-s, or ISO-8601 string). If absent, server receipt time is used.
+
+#### Example — curl
 
 ```bash
-printf '{"level":"info","msg":"deployed","timestamp":1710000000000}\n{"level":"warn","msg":"disk 90%%"}\n' \
-  | curl -s -X POST "https://<api-id>.execute-api.<region>.amazonaws.com/v1/ingest?owner=myapp" \
-         -H "x-api-key: YOUR_KEY" \
+printf '{"level":"info","msg":"boot ok","timestamp":1710000000000}\n{"level":"warn","msg":"disk 90%%"}\n' \
+  | curl -s -X POST "http://localhost:8000/ingest?owner=myapp" \
+         -H "X-API-Key: YOUR_KEY" \
          -H "Content-Type: application/x-ndjson" \
          --data-binary @-
 ```
 
-Response:
+#### Response
 
 ```json
 {
@@ -76,37 +76,32 @@ Returns `{"status": "healthy"}`.
 
 ## CLI — `trailhead-cli`
 
-The CLI uses boto3 directly (no running server required). Install it locally:
-
-```bash
-cd trailhead
-pip install -e .
-```
-
 ### `import-logs`
 
+Import from a local file directly to CloudWatch (no running server required).
+
 ```bash
-# Plain text log
+# Plain text log file
 trailhead-cli import-logs access.log --owner nginx --create-group
 
-# JSONL
+# JSONL file
 trailhead-cli import-logs events.jsonl --owner billing -r us-west-2
 
-# SQLite
-trailhead-cli import-logs app.db --owner backend -f sqlite \
+# SQLite database
+trailhead-cli import-logs app.db --owner backend --format sqlite \
     --table events --ts-col created_at --msg-col payload
 
-# Custom SQL
-trailhead-cli import-logs app.db --owner backend -f sqlite \
+# Custom SQL query
+trailhead-cli import-logs app.db --owner backend --format sqlite \
     --query "SELECT * FROM logs WHERE level='ERROR'"
 
-# Dry run
+# Dry run (parse & validate, no upload)
 trailhead-cli import-logs huge.log --owner test --dry-run
 ```
 
 ### `create-group`
 
-Pre-create a log group with optional retention policy.
+Pre-create a CloudWatch log group with optional retention.
 
 ```bash
 trailhead-cli create-group --owner myapp --retention 30
@@ -114,50 +109,36 @@ trailhead-cli create-group --owner myapp --retention 30
 
 ---
 
-## SAM template parameters
+## Configuration
 
-| Parameter | Default | Description |
-|---|---|---|
-| `LogGroupPrefix` | `/trailhead` | Prefix for CloudWatch log groups |
-| `AutoCreateGroups` | `true` | Auto-create groups on first ingest per owner |
+`config.yaml` (or set `TRAILHEAD_CONFIG` env var to a custom path):
 
-Override during deploy:
+```yaml
+server:
+  host: "0.0.0.0"
+  port: 8000
 
-```bash
-sam deploy --parameter-overrides LogGroupPrefix=/logs AutoCreateGroups=false
+auth:
+  api_keys:
+    - "your-secret-key"
+
+aws:
+  region: "us-east-1"
+  log_group_prefix: "/trailhead"
+  auto_create_groups: false    # set true for dev convenience
+
+ingest:
+  max_batch_events: 10000     # per PutLogEvents call
+  max_batch_bytes: 1048576    # 1 MB per batch
 ```
 
 ---
 
-## Local development
+## Architecture notes
 
-```bash
-sam build
-sam local start-api          # requires Docker
-# Then:
-curl http://127.0.0.1:3000/health
-```
-
----
-
-## Architecture
-
-```
-Client ──▶ API Gateway (REST, x-api-key enforced)
-               │
-               ▼
-           Lambda (handler.py)
-               │
-               ├─ parse NDJSON body
-               ├─ ensure log group exists
-               ├─ create log stream per request
-               └─ batch PutLogEvents (10k events / 1MB per call)
-               │
-               ▼
-         CloudWatch Logs
-           /trailhead/{owner}
-```
-
-- **Payload limit**: ~6 MB per request (Lambda sync invocation limit). For larger imports, use `trailhead-cli import-logs` which streams directly via boto3 with no size cap.
-- **Throttle defaults**: 100 req/s sustained, 200 burst (configurable in `template.yaml` UsagePlan).
-- **Extensibility**: the owner/log-group routing sets up cleanly for CloudWatch subscription filters, Kinesis fan-out, or Metrics Filters when you add real-time analytics.
+- **Server**: FastAPI + Hypercorn (HTTP/2 ready; QUIC/HTTP/3 possible with `aioquic`)
+- **CloudWatch client**: `aiobotocore` for fully async I/O — no thread-pool bottleneck
+- **Batching**: events accumulate in memory and flush automatically when CloudWatch size/count limits are reached, or when the request stream ends
+- **CLI**: sync `boto3` for straightforward batch uploads with Rich progress bars
+- **Timestamps**: auto-parsed from epoch-ms, epoch-s, or ISO-8601; falls back to ingest time
+- **Extensibility**: the owner/log-group routing and streaming ingest provide the foundation for real-time analytics pipelines (Kinesis tap, Lambda fan-out, etc.)

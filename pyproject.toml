@@ -5,15 +5,22 @@ build-backend = "hatchling.build"
 [project]
 name = "trailhead"
 version = "0.1.0"
-description = "Serverless log ingestion API backed by AWS CloudWatch (SAM + Lambda)"
+description = "High-performance async log ingestion API backed by AWS CloudWatch"
 requires-python = ">=3.9"
 dependencies = [
-    "boto3>=1.35",
+    "fastapi>=0.115",
+    "hypercorn[h2]>=0.17",
+    "pyyaml>=6.0",
+    "aiobotocore>=2.15",
+    "pydantic>=2.0",
     "typer>=0.12",
     "rich>=13.0",
+    "orjson>=3.10",
+    "boto3>=1.35",
 ]
 
 [project.scripts]
+trailhead = "trailhead.app:run"
 trailhead-cli = "trailhead.cli:main"
 
 [tool.hatch.build.targets.wheel]
