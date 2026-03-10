@@ -3,31 +3,25 @@
 Serverless log ingestion API backed by AWS CloudWatch Logs.
 
 - **One-command deploy** — `sam build && sam deploy --guided`, done
-- **Zero external deps** — Lambda handler uses only stdlib + boto3 from the runtime
-- **API-key auth at the edge** — API Gateway manages keys and usage plans; Lambda never sees unauthorized traffic
-- **Owner-based routing** — each `owner` maps to a CloudWatch log group (`/trailhead/{owner}`)
-- **CLI bulk import** — ship `.log`, `.jsonl`, or SQLite databases straight to CloudWatch
+- **Zero external deps** — Lambda handler uses only stdlib + boto3
+- **API-key auth at the edge** — API Gateway manages keys and usage plans
+- **Direct mode** — pipe your server's output straight to CloudWatch, no API needed
+- **CLI bulk import** — ship `.log`, `.jsonl`, or SQLite databases
 
 ---
 
-## Deploy
+## Deploy (API mode)
 
 Prerequisites: [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html) and configured AWS credentials.
 
 ```bash
 sam build
-sam deploy --guided   # first time — picks region, stack name, creates S3 bucket
+sam deploy --guided
 ```
 
-After deploy, the stack outputs two values:
-
-| Output | Description |
-|---|---|
-| `ApiUrl` | Base URL, e.g. `https://abc123.execute-api.us-east-1.amazonaws.com/v1` |
-| `ApiKeyId` | Key ID — retrieve the secret with the command below |
+Retrieve your API key:
 
 ```bash
-# Get your API key value
 aws apigateway get-api-key --api-key <ApiKeyId> --include-value --query 'value' --output text
 ```
 
@@ -44,28 +38,12 @@ Accepts **NDJSON** (one JSON object per line).
 | `x-api-key` | yes | API key managed by API Gateway |
 | `owner` (query) | yes | Owner tag — routes to `/trailhead/{owner}` log group |
 
-Each JSON line may include a `timestamp` field (epoch-ms, epoch-s, or ISO-8601). If absent, server receipt time is used.
-
 ```bash
-printf '{"level":"info","msg":"deployed","timestamp":1710000000000}\n{"level":"warn","msg":"disk 90%%"}\n' \
+printf '{"level":"info","msg":"deployed"}\n{"level":"warn","msg":"disk 90%%"}\n' \
   | curl -s -X POST "https://<api-id>.execute-api.<region>.amazonaws.com/v1/ingest?owner=myapp" \
          -H "x-api-key: YOUR_KEY" \
          -H "Content-Type: application/x-ndjson" \
          --data-binary @-
-```
-
-Response:
-
-```json
-{
-  "status": "ok",
-  "owner": "myapp",
-  "log_group": "/trailhead/myapp",
-  "log_stream": "2026/03/10/a1b2c3d4e5f6",
-  "accepted": 2,
-  "rejected": 0,
-  "flushed": 2
-}
 ```
 
 ### `GET /health`
@@ -76,75 +54,85 @@ Returns `{"status": "healthy"}`.
 
 ## CLI — `trailhead-cli`
 
-Install locally:
-
 ```bash
 cd trailhead
 pip install -e .
 ```
 
-### Quickstart: zero-disk nginx log shipping
-
-Point nginx at a named pipe — logs never touch disk:
+### Quickstart: stream ruph (or any server) logs to CloudWatch
 
 ```bash
 # 1. Create a log group
-trailhead-cli create-group --owner secondpageai_access --retention 30
+trailhead-cli create-group --owner mysite_access --retention 30
 
-# 2. Export your API URL and key
+# 2. Point ship at your ruph log_full SQLite database
 export TRAILHEAD_API_URL=https://<api-id>.execute-api.<region>.amazonaws.com/v1
 export TRAILHEAD_API_KEY=<your-key>
 
-# 3. Start the shipper — it creates the pipe and removes it on exit
-trailhead-cli ship /var/log/nginx/access.pipe -o secondpageai_access --mkfifo &
-
-# 4. Point nginx at the pipe (in your nginx.conf)
-#    access_log /var/log/nginx/access.pipe combined;
-#    Then: nginx -s reload
+trailhead-cli ship /var/www/live/ruph_logs/requests.db -o mysite_access
 ```
 
-`--mkfifo` creates the named pipe automatically using Python's `os.mkfifo()` (no system packages needed) and removes it on exit (SIGTERM, SIGINT, or normal shutdown). The shipper auto-reconnects when nginx restarts.
+That's it. The CLI auto-detects SQLite files, polls for new rows, and ships them as NDJSON through the Lambda API. It resumes across restarts via a state file (`requests.db.trailhead-state`).
 
-Log groups are named `{prefix}/{owner}` — with the default prefix that's `/trailhead/secondpageai_access`.
+Each request row is serialized as a JSON object with all fields — IP, method, host, path, status, headers, duration, user-agent, etc. The `ts_epoch_ms` column maps to the CloudWatch event timestamp for correct ordering.
+
+Log groups are named `{prefix}/{owner}` — default is `/trailhead/mysite_access`.
 
 ### `ship`
 
-Stream logs to the Trailhead API in real time. Reads from a named pipe (FIFO), file, or stdin. Batches lines and POSTs them as NDJSON with connection reuse and automatic retries.
+Stream logs to CloudWatch in real time.
 
-JSON lines are forwarded as-is. Plain text lines (standard nginx/apache format) are wrapped as `{"message": "..."}` with auto-detected timestamps.
+**SQLite tailing (recommended for ruph `log_full`)** — polls the database for new rows:
 
 ```bash
-# Zero-disk: creates the pipe, removes it on exit
-trailhead-cli ship /tmp/access.pipe -o mysite_access --mkfifo
+# Via the API (needs TRAILHEAD_API_URL + TRAILHEAD_API_KEY env vars)
+trailhead-cli ship /path/to/requests.db -o mysite_access
 
-# Tail a regular log file
-trailhead-cli ship /var/log/nginx/access.log -o mysite_access --follow
+# Ship everything from the beginning (backfill)
+trailhead-cli ship /path/to/requests.db -o mysite_access --from-start
 
-# Pipe from any process
-my_app 2>&1 | trailhead-cli ship -o myapp
-
-# Read a file once (no --follow), then exit
-trailhead-cli ship /var/log/nginx/access.log.1 -o mysite_access
-
-# Tune batch size and flush interval
-trailhead-cli ship /var/log/app.log -o myapp --follow --batch-size 200 --flush-interval 2
+# Direct to CloudWatch (no API needed)
+trailhead-cli ship /path/to/requests.db -o mysite_access --direct --create-group
 ```
 
-Set `TRAILHEAD_API_URL` and `TRAILHEAD_API_KEY` env vars to avoid passing `--api-url` and `--api-key` every time. Handles SIGTERM/SIGINT gracefully (flushes remaining buffer before exit).
+SQLite mode:
+- Auto-detected by `.db`/`.sqlite` extension or file header
+- Reads from the `requests` table (override with `--table`)
+- Tracks last processed row ID in a state file for restart resilience
+- Polls every 1s for new rows, batches and flushes per `--batch-size`/`--flush-interval`
+- WAL mode allows safe concurrent reads while ruph writes
+
+**stdin piping** — for servers that can write to stdout:
+
+```bash
+my_server 2>&1 | trailhead-cli ship -o mysite_access --direct
+```
+
+**File tailing** — for text log files:
+
+```bash
+trailhead-cli ship /var/log/access.log -o mysite_access --follow
+```
+
+Two backends:
+- **API mode** (default): POSTs NDJSON batches to the Trailhead Lambda API. Needs `--api-url`/`--api-key` or env vars.
+- **`--direct`**: sends straight to CloudWatch via boto3. No API deployment needed.
+
+Handles SIGTERM/SIGINT gracefully (flushes buffer before exit).
 
 **Running as a systemd service:**
 
 ```ini
 # /etc/systemd/system/trailhead-ship.service
 [Unit]
-Description=Trailhead log shipper
+Description=Trailhead log shipper (ruph → CloudWatch)
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/trailhead-cli ship /var/log/nginx/access.pipe --owner mysite_access --mkfifo
 Environment=TRAILHEAD_API_URL=https://<api-id>.execute-api.<region>.amazonaws.com/v1
 Environment=TRAILHEAD_API_KEY=<your-key>
+ExecStart=/usr/local/bin/trailhead-cli ship /var/www/live/ruph_logs/requests.db --owner mysite_access
 Restart=always
 RestartSec=5
 
@@ -154,61 +142,21 @@ WantedBy=multi-user.target
 
 ### `create-group`
 
-Pre-create a CloudWatch log group for an owner. Use this when you want to set retention or prepare groups before any logs arrive.
+Pre-create a CloudWatch log group with optional retention.
 
 ```bash
 trailhead-cli create-group --owner mysite_access                  # no expiry
-trailhead-cli create-group --owner mysite_access --retention 30   # expire after 30 days
-trailhead-cli create-group --owner billing -r us-west-2           # different region
+trailhead-cli create-group --owner mysite_access --retention 30   # 30 days
 ```
 
 ### `import-logs`
 
-Bulk-import a local file directly into CloudWatch (via boto3, no API needed). Useful for backfilling historical logs.
-
-The group must already exist, or pass `--create-group` to auto-create.
+Bulk-import a local file directly into CloudWatch via boto3. Useful for backfilling.
 
 ```bash
-# Plain text log file
 trailhead-cli import-logs access.log --owner nginx --create-group
-
-# JSONL
-trailhead-cli import-logs events.jsonl --owner billing -r us-west-2
-
-# SQLite
-trailhead-cli import-logs app.db --owner backend -f sqlite \
-    --table events --ts-col created_at --msg-col payload
-
-# Dry run — parse and validate without uploading
+trailhead-cli import-logs app.db --owner backend -f sqlite --table events
 trailhead-cli import-logs huge.log --owner test --dry-run
-```
-
-File format is auto-detected from extension (`.log`/`.txt` → text, `.jsonl`/`.ndjson` → JSONL, `.sqlite`/`.db` → SQLite). Override with `--format text|jsonl|sqlite`.
-
----
-
-## SAM template parameters
-
-| Parameter | Default | Description |
-|---|---|---|
-| `LogGroupPrefix` | `/trailhead` | Prefix for CloudWatch log groups |
-| `AutoCreateGroups` | `true` | Auto-create groups on first ingest per owner |
-
-Override during deploy:
-
-```bash
-sam deploy --parameter-overrides LogGroupPrefix=/logs AutoCreateGroups=false
-```
-
----
-
-## Local development
-
-```bash
-sam build
-sam local start-api          # requires Docker
-# Then:
-curl http://127.0.0.1:3000/health
 ```
 
 ---
@@ -216,21 +164,21 @@ curl http://127.0.0.1:3000/health
 ## Architecture
 
 ```
-Client ──▶ API Gateway (REST, x-api-key enforced)
-               │
-               ▼
-           Lambda (handler.py)
-               │
-               ├─ parse NDJSON body
-               ├─ ensure log group exists
-               ├─ create log stream per request
-               └─ batch PutLogEvents (10k events / 1MB per call)
-               │
-               ▼
-         CloudWatch Logs
-           /trailhead/{owner}
+                                  ┌─ API mode ─────────────────────────┐
+                                  │                                    │
+Client ──▶ API Gateway (x-api-key)│──▶ Lambda ──▶ CloudWatch Logs     │
+                                  └────────────────────────────────────┘
+
+                                  ┌─ Direct mode ──────────────────────┐
+                                  │                                    │
+my_server | trailhead-cli ship ───│──▶ boto3  ──▶ CloudWatch Logs      │
+                                  └────────────────────────────────────┘
+
+CloudWatch Logs
+  /trailhead/{owner}
+    └── 2026/03/10/{stream-id}
 ```
 
-- **Payload limit**: ~6 MB per request (Lambda sync invocation limit). For larger imports, use `trailhead-cli import-logs` which streams directly via boto3 with no size cap.
-- **Throttle defaults**: 100 req/s sustained, 200 burst (configurable in `template.yaml` UsagePlan).
-- **Extensibility**: the owner/log-group routing sets up cleanly for CloudWatch subscription filters, Kinesis fan-out, or Metrics Filters when you add real-time analytics.
+- **Payload limit (API)**: ~6 MB per request (Lambda limit). Use `--direct` or `import-logs` for larger payloads.
+- **Throttle (API)**: 100 req/s sustained, 200 burst (configurable in `template.yaml`).
+- **Extensibility**: owner/log-group routing sets up for CloudWatch subscription filters, Kinesis fan-out, or Metrics Filters for real-time analytics.

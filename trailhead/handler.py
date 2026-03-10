@@ -20,15 +20,11 @@ _PREFIX = os.environ.get("LOG_GROUP_PREFIX", "/trailhead")
 _AUTO_CREATE = os.environ.get("AUTO_CREATE_GROUPS", "true").lower() == "true"
 _OWNER_RE = re.compile(r"^[a-zA-Z0-9_\-\.]{1,128}$")
 
-# PutLogEvents hard limits
 _MAX_EVENTS = 10_000
 _MAX_BYTES = 1_048_576
-_OVERHEAD = 26  # per-event wire overhead
+_OVERHEAD = 26
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 def _resp(status: int, body: dict) -> dict:
     return {
         "statusCode": status,
@@ -38,7 +34,6 @@ def _resp(status: int, body: dict) -> dict:
 
 
 def _parse_ts(raw) -> int | None:
-    """Best-effort parse to epoch-ms."""
     if isinstance(raw, (int, float)):
         return int(raw * 1000) if raw < 1e12 else int(raw)
     if isinstance(raw, str):
@@ -63,9 +58,6 @@ def _flush(log_group: str, log_stream: str, events: list[dict]) -> None:
     )
 
 
-# ---------------------------------------------------------------------------
-# Routing
-# ---------------------------------------------------------------------------
 def lambda_handler(event, context):
     path = event.get("path", "")
     method = event.get("httpMethod", "")
@@ -79,9 +71,6 @@ def lambda_handler(event, context):
     return _handle_ingest(event)
 
 
-# ---------------------------------------------------------------------------
-# POST /ingest
-# ---------------------------------------------------------------------------
 def _handle_ingest(event: dict) -> dict:
     params = event.get("queryStringParameters") or {}
     owner = params.get("owner", "")
@@ -90,7 +79,6 @@ def _handle_ingest(event: dict) -> dict:
 
     log_group = f"{_PREFIX.rstrip('/')}/{owner}"
 
-    # --- ensure log group ---
     if _AUTO_CREATE:
         try:
             _logs.create_log_group(logGroupName=log_group)
@@ -105,12 +93,10 @@ def _handle_ingest(event: dict) -> dict:
         except ClientError as exc:
             return _resp(500, {"error": str(exc)})
 
-    # --- create log stream ---
     day = datetime.now(timezone.utc).strftime("%Y/%m/%d")
     log_stream = f"{day}/{uuid.uuid4().hex[:12]}"
     _logs.create_log_stream(logGroupName=log_group, logStreamName=log_stream)
 
-    # --- parse NDJSON body ---
     body = event.get("body", "") or ""
     if event.get("isBase64Encoded"):
         body = base64.b64decode(body).decode()

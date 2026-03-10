@@ -21,7 +21,6 @@ Globals:
     MemorySize: 256
 
 Resources:
-  # ---- API Gateway (REST, API-key required on every route) ----
   Api:
     Type: AWS::Serverless::Api
     Properties:
@@ -29,7 +28,6 @@ Resources:
       Auth:
         ApiKeyRequired: true
 
-  # ---- Lambda ----
   IngestFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -66,7 +64,6 @@ Resources:
             Path: /health
             Method: GET
 
-  # ---- API Key + Usage Plan ----
   ApiKey:
     Type: AWS::ApiGateway::ApiKey
     DependsOn: Apiv1Stage

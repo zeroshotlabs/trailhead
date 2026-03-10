@@ -1,9 +1,2 @@
 # Lambda handler: no external deps — boto3 is included in the runtime.
 # CLI tool: install via `pip install -e .` (uses pyproject.toml).
-boto3==1.42.64
-botocore==1.42.64
-jmespath==1.1.0
-python-dateutil==2.9.0.post0
-s3transfer==0.16.0
-six==1.17.0
-urllib3==2.6.3
