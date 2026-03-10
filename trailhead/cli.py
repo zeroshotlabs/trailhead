@@ -36,7 +36,7 @@ app = typer.Typer(
         "Typical workflow:\n\n"
         "  1. trailhead-cli create-group --owner mysite_access\n\n"
         "  2. trailhead-cli ship /path/to/requests.db -o mysite_access\n\n"
-        "Also works with stdin piping, log files, and named pipes:\n\n"
+        "Also works with stdin piping and log files:\n\n"
         "  my_server | trailhead-cli ship -o mysite_access --direct\n\n"
         "Or bulk-import an existing file:\n\n"
         "  trailhead-cli import-logs app.log --owner myapp\n\n"
@@ -388,9 +388,7 @@ def _row_to_json(row: dict) -> str:
 class _SQLiteTailer:
     """Polls a SQLite database for new rows, yielding them as JSON lines.
 
-    State is only persisted after confirm() to guarantee at-least-once
-    delivery.  When purge=True, confirmed rows are deleted from the DB
-    so the file stays small.
+    State is persisted after confirm() to guarantee at-least-once delivery.
     """
 
     def __init__(
@@ -398,7 +396,6 @@ class _SQLiteTailer:
         db_path: Path,
         state_file: Path | None,
         from_start: bool,
-        purge: bool = False,
         table: str = "requests",
         poll_limit: int = 500,
     ):
@@ -406,12 +403,9 @@ class _SQLiteTailer:
         self.state_file = state_file
         self.table = table
         self._poll_limit = poll_limit
-        self._purge = purge
-        self._purge_count = 0
         self.needs_reopen = False
 
-        mode = "rw" if purge else "ro"
-        self._conn = sqlite3.connect(f"file:{db_path}?mode={mode}", uri=True)
+        self._conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         self._conn.row_factory = sqlite3.Row
 
         self._confirmed_id = 0
@@ -450,11 +444,10 @@ class _SQLiteTailer:
         return lines
 
     def confirm(self) -> None:
-        """Mark all read rows as shipped.  Persists state and optionally purges."""
+        """Mark all read rows as shipped and persist state."""
         if self._read_id <= self._confirmed_id:
             return
 
-        old = self._confirmed_id
         self._confirmed_id = self._read_id
 
         if self.state_file:
@@ -462,21 +455,6 @@ class _SQLiteTailer:
                 self.state_file.write_text(str(self._confirmed_id))
             except OSError:
                 pass
-
-        if self._purge:
-            self._conn.execute(
-                f"DELETE FROM [{self.table}] WHERE id <= ?",
-                (self._confirmed_id,),
-            )
-            self._conn.commit()
-            self._purge_count += 1
-            # Reclaim free pages every 100 purge cycles (~8-10 min at 1s poll).
-            # VACUUM rewrites the file; pages are reused between vacuums anyway.
-            if self._purge_count % 100 == 0:
-                try:
-                    self._conn.execute("VACUUM")
-                except sqlite3.OperationalError:
-                    pass
 
     def close(self) -> None:
         self._conn.close()
@@ -641,9 +619,9 @@ def _ship_batch_direct(uploader: _CWUploader, lines: list[str]) -> int:
 
 _SHIP_EPILOG = (
     "[dim]Examples:\n\n"
-    "  trailhead-cli ship /path/to/requests.db -o mysite_access\n\n"
-    "  my_server | trailhead-cli ship -o mysite_access --direct\n\n"
-    "  trailhead-cli ship /var/log/access.log -o mysite_access --follow\n\n"
+    "  trailhead-cli ship /path/to/requests.db -o mysite\n\n"
+    "  my_server | trailhead-cli ship -o mysite --direct\n\n"
+    "  trailhead-cli ship /var/log/access.log -o mysite --follow\n\n"
     "  Set TRAILHEAD_API_URL and TRAILHEAD_API_KEY env vars for API mode.[/]"
 )
 
@@ -680,11 +658,6 @@ def ship(
         False, "--create-group", help="Auto-create the log group (--direct mode)",
         rich_help_panel="Direct mode",
     ),
-    purge: bool = typer.Option(
-        False, "--purge",
-        help="Delete shipped rows from the SQLite DB to keep it small",
-        rich_help_panel="SQLite tailing",
-    ),
     state_file: Optional[Path] = typer.Option(
         None, "--state-file",
         help="State file for SQLite resume tracking [dim](default: {db}.trailhead-state)[/]",
@@ -694,10 +667,6 @@ def ship(
         "requests", "--table",
         help="SQLite table to poll",
         rich_help_panel="SQLite tailing",
-    ),
-    mkfifo: bool = typer.Option(
-        False, "--mkfifo",
-        help="Create a named pipe at FILE, removed on exit (zero-disk mode)"
     ),
     follow: bool = typer.Option(
         False, "--follow", help="Tail the file continuously"
@@ -721,7 +690,6 @@ def ship(
     • SQLite database (auto-detected) — polls for new rows, resumes across restarts
     • stdin (omit FILE) — pipe your server's output
     • log file (with [bold]--follow[/]) — tails a text/NDJSON file
-    • named pipe ([bold]--mkfifo[/]) — zero-disk mode
 
     [bold]Backends:[/]
     • API mode (default): POSTs NDJSON to the Trailhead Lambda API
@@ -738,19 +706,9 @@ def ship(
     # --- set up input source ---
     is_stdin = file is None or str(file) == "-"
     is_sqlite = not is_stdin and file is not None and file.exists() and _is_sqlite_file(file)
-    created_fifo: Path | None = None
 
     if not is_stdin and not is_sqlite:
-        if mkfifo:
-            if file.exists():
-                if not stat.S_ISFIFO(os.stat(str(file)).st_mode):
-                    console.print(f"[red]Path exists and is not a FIFO:[/] {file}")
-                    raise typer.Exit(1)
-            else:
-                os.mkfifo(str(file))
-                created_fifo = file
-                console.print(f"[green]Created FIFO:[/] {file}")
-        elif not file.exists():
+        if not file.exists():
             console.print(f"[red]File not found:[/] {file}")
             raise typer.Exit(1)
 
@@ -785,12 +743,11 @@ def ship(
     if is_sqlite:
         sf = state_file or Path(str(file) + ".trailhead-state")
         db_tailer = _SQLiteTailer(
-            file, sf, from_start, purge=purge, table=db_table, poll_limit=batch_size,
+            file, sf, from_start, table=db_table, poll_limit=batch_size,
         )
         follow = True
-        mode_info = "purge after ship" if purge else "keep rows"
         console.print(f"[bold]Shipping[/] SQLite {file} → {dest}")
-        console.print(f"  [dim]table={db_table}  {db_tailer.position_info}  state={sf}  ({mode_info})[/]")
+        console.print(f"  [dim]table={db_table}  {db_tailer.position_info}  state={sf}[/]")
     elif not is_stdin:
         is_fifo = stat.S_ISFIFO(os.stat(str(file)).st_mode)
         if is_fifo:
@@ -883,12 +840,6 @@ def ship(
             tailer.close()
         if session:
             session.close()
-        if created_fifo:
-            try:
-                os.unlink(str(created_fifo))
-                console.print(f"[dim]Removed FIFO: {created_fifo}[/]")
-            except OSError:
-                pass
 
     console.print(f"\n[bold green]Done.[/]  total shipped: {total_shipped}")
 
