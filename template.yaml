@@ -1,0 +1,107 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Trailhead — serverless log ingestion API backed by CloudWatch Logs.
+  Deploys a Lambda behind API Gateway (REST) with managed API-key auth.
+
+Parameters:
+  LogGroupPrefix:
+    Type: String
+    Default: /trailhead
+    Description: CloudWatch log group prefix — groups are created as {prefix}/{owner}
+  AutoCreateGroups:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Auto-create log groups on first ingest for a new owner
+
+Globals:
+  Function:
+    Timeout: 60
+    MemorySize: 256
+
+Resources:
+  # ---- API Gateway (REST, API-key required on every route) ----
+  Api:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: v1
+      Auth:
+        ApiKeyRequired: true
+
+  # ---- Lambda ----
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Runtime: python3.12
+      Handler: trailhead.handler.lambda_handler
+      CodeUri: .
+      Environment:
+        Variables:
+          LOG_GROUP_PREFIX: !Ref LogGroupPrefix
+          AUTO_CREATE_GROUPS: !Ref AutoCreateGroups
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - logs:DescribeLogGroups
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${LogGroupPrefix}*"
+      Events:
+        Ingest:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /ingest
+            Method: POST
+        Health:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /health
+            Method: GET
+
+  # ---- API Key + Usage Plan ----
+  ApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    DependsOn: Apiv1Stage
+    Properties:
+      Name: !Sub "${AWS::StackName}-key"
+      Enabled: true
+      StageKeys:
+        - RestApiId: !Ref Api
+          StageName: v1
+
+  UsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: Apiv1Stage
+    Properties:
+      UsagePlanName: !Sub "${AWS::StackName}-plan"
+      ApiStages:
+        - ApiId: !Ref Api
+          Stage: v1
+      Throttle:
+        RateLimit: 100
+        BurstLimit: 200
+
+  UsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref UsagePlan
+
+Outputs:
+  ApiUrl:
+    Description: Base URL for the Trailhead API
+    Value: !Sub "https://${Api}.execute-api.${AWS::Region}.amazonaws.com/v1"
+  ApiKeyId:
+    Description: >
+      API key ID — retrieve the actual secret with:
+      aws apigateway get-api-key --api-key <ID> --include-value
+    Value: !Ref ApiKey

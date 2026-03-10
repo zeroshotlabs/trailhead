@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "trailhead"
+version = "0.1.0"
+description = "Serverless log ingestion API backed by AWS CloudWatch (SAM + Lambda)"
+requires-python = ">=3.9"
+dependencies = [
+    "boto3>=1.35",
+    "typer>=0.12",
+    "rich>=13.0",
+]
+
+[project.scripts]
+trailhead-cli = "trailhead.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["trailhead"]

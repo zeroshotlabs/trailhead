@@ -1,0 +1,11 @@
+.venv/
+.aws-sam/
+.git/
+__pycache__/
+*.pyc
+*.egg-info/
+README.md
+samconfig.toml
+pyproject.toml
+.gitignore
+.samignore
