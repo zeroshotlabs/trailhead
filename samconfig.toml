@@ -5,3 +5,10 @@ stack_name = "trailhead"
 resolve_s3 = true
 capabilities = "CAPABILITY_IAM"
 confirm_changeset = true
+s3_prefix = "trailhead"
+region = "ca-central-1"
+parameter_overrides = "LogGroupPrefix=\"/trailhead\" AutoCreateGroups=\"true\""
+image_repositories = []
+
+[default.global.parameters]
+region = "ca-central-1"

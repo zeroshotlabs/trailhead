@@ -31,7 +31,7 @@ Resources:
   IngestFunction:
     Type: AWS::Serverless::Function
     Properties:
-      Runtime: python3.12
+      Runtime: python3.14
       Handler: trailhead.handler.lambda_handler
       CodeUri: .
       Environment:
